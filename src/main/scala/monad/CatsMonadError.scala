@@ -3,7 +3,6 @@ package monad
 import cats.MonadError
 import cats.instances.either._
 
-
 object CatsMonadError extends App {
   type ErrorOr[A] = Either[String, A]
 

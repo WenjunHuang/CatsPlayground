@@ -35,10 +35,10 @@ object CatsMonad extends App {
 
   sumSquare(Option(3), Option(4))
 
-  def sumSquare[F[_] : Monad](a: F[Int], b: F[Int]): F[Int] =
+  def sumSquare[F[_]: Monad](a: F[Int], b: F[Int]): F[Int] =
     a.flatMap(x => b.map(y => x * x + y * y))
 
-  def forSumSquare[F[_] : Monad](a: F[Int], b: F[Int]): F[Int] =
+  def forSumSquare[F[_]: Monad](a: F[Int], b: F[Int]): F[Int] =
     for {
       x <- a
       y <- b
