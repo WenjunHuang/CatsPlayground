@@ -1,0 +1,93 @@
+Exercises: improving our small IO program
+To finalize we propose you some exercises that will help you to keep improving your IO-kungfu:
+
+Modify the IOApp so it shows an error and abort the execution if the origin and destination files are the same, the origin file cannot be open for reading or the destination file cannot be opened for writing. Also, if the destination file already exists, the program should ask for confirmation before overwriting that file.
+Modify transmit so the buffer size is not hardcoded but passed as parameter.
+Use some other concurrency tool of cats-effect instead of semaphore to ensure mutual exclusion of transfer execution and streams closing.
+Create a new program able to copy folders. If the origin folder has subfolders, then their contents must be recursively copied too. Of course the copying must be safely cancelable at any moment.
+TCP echo server - concurrent system with Fibers
+This program is a bit more complex than the previous one. Here we create an echo TCP server that replies to each text message from a client sending back that same message. When the client sends an empty line its connection is shutdown by the server. This server will also bring a key feature, it will be able to attend several clients at the same time. For that we will use cats-effect’s Fiber, which can be seen as light threads. For each new client a Fiber instance will be spawned to serve that client.
+
+We will stick to a simple design principle: whoever method creates a resource is the sole responsible of dispatching it! It’s worth to remark this from the beginning to better understand the code listings shown in this tutorial.
+
+Ok, we are ready to start coding our server. Let’s build it step-by-step. First we will code a method that implements the echo protocol. It will take as input the socket (java.net.Socket instance) that is connected to the client. The method will be basically a loop that at each iteration reads the input from the client, if the input is not an empty line then the text is sent back to the client, otherwise the method will finish.
+
+The method signature will look like this:
+
+import cats.effect.Sync
+import java.net.Socket
+def echoProtocol[F[_]: Sync](clientSocket: Socket): F[Unit] = ???
+Reading and writing will be done using java.io.BufferedReader and java.io.BufferedWriter instances built from the socket. Recall that this method will be in charge of closing those buffers, but not the client socket (it did not create that socket after all!). We will use again Resource to ensure that we close the streams we create. Also, all actions with potential side-effects are encapsulated in F instances, where F only requires an implicit instance of Sync[F] to be present. That way we ensure no side-effect is actually run until the F returned by this method is evaluated. With this in mind, the code looks like:
+
+import cats.effect._
+import cats.implicits._
+import java.io._
+import java.net._
+
+def echoProtocol[F[_]: Sync](clientSocket: Socket): F[Unit] = {
+
+  def loop(reader: BufferedReader, writer: BufferedWriter): F[Unit] = for {
+    line <- Sync[F].delay(reader.readLine())
+    _    <- line match {
+              case "" => Sync[F].unit // Empty line, we are done
+              case _  => Sync[F].delay{ writer.write(line); writer.newLine(); writer.flush() } >> loop(reader, writer)
+            }
+  } yield ()
+
+  def reader(clientSocket: Socket): Resource[F, BufferedReader] =
+    Resource.make {
+      Sync[F].delay( new BufferedReader(new InputStreamReader(clientSocket.getInputStream())) )
+    } { reader =>
+      Sync[F].delay(reader.close()).handleErrorWith(_ => Sync[F].unit)
+    }
+
+  def writer(clientSocket: Socket): Resource[F, BufferedWriter] =
+    Resource.make {
+      Sync[F].delay( new BufferedWriter(new PrintWriter(clientSocket.getOutputStream())) )
+    } { writer =>
+      Sync[F].delay(writer.close()).handleErrorWith(_ => Sync[F].unit)
+    }
+
+  def readerWriter(clientSocket: Socket): Resource[F, (BufferedReader, BufferedWriter)] =
+    for {
+      reader <- reader(clientSocket)
+      writer <- writer(clientSocket)
+    } yield (reader, writer)
+
+  readerWriter(clientSocket).use { case (reader, writer) =>
+    loop(reader, writer) // Let's get to work
+  }
+}
+Note that, as we did in the previous example, we swallow possible errors when closing the streams, as there is little to do in such cases.
+
+The actual interaction with the client is done by the loop function. It tries to read a line from the client, and if successful then it checks the line content. If empty it finishes the method, if not it sends back the line through the writer and loops back to the beginning. And what happens if we find any error in the reader.readLine() call? Well, F will catch the exception and will short-circuit the evaluation, this method would then return an F instance carrying the caught exception. Easy, right :) ?
+
+So we are done with our echoProtocol method, good! But we still miss the part of our server that will listen for new connections and create fibers to attend them. Let’s work on that, we implement that functionality in another method that takes as input the java.io.ServerSocket instance that will listen for clients:
+
+import cats.effect._
+import cats.effect.syntax.all._
+import cats.effect.ExitCase._
+import cats.implicits._
+import java.net.{ServerSocket, Socket}
+
+// echoProtocol as defined before
+def echoProtocol[F[_]: Sync](clientSocket: Socket): F[Unit] = ???
+
+def serve[F[_]: Concurrent](serverSocket: ServerSocket): F[Unit] = {
+  def close(socket: Socket): F[Unit] =
+    Sync[F].delay(socket.close()).handleErrorWith(_ => Sync[F].unit)
+
+  for {
+    _ <- Sync[F]
+      .delay(serverSocket.accept())
+      .bracketCase { socket =>
+        echoProtocol(socket)
+          .guarantee(close(socket))                 // Ensuring socket is closed
+          .start                                    // Will run in its own Fiber!
+      }{ (socket, exit) => exit match {
+        case Completed => Sync[F].unit
+        case Error(_) | Canceled => close(socket)
+      }}
+          _ <- serve(serverSocket)                  // Looping back to the beginning
+  } yield ()
+}
